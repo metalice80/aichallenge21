@@ -1,10 +1,9 @@
-"""Независимый от UI пайплайн ответов с RAG и без RAG."""
+"""Независимый от UI пайплайн ответов no-RAG, Baseline, Filtered и Enhanced RAG."""
 
 from __future__ import annotations
 
 import re
 import time
-from collections import Counter
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -13,19 +12,29 @@ from typing import Literal, Protocol
 from .config import INDEX_ROOT
 from .embeddings import EmbeddingService
 from .llm import LLMError, LLMProvider
-from .models import AnswerResult, RetrievedChunk
+from .models import AnswerResult, RetrievalConfig, RetrievedChunk
 from .prompts import build_no_rag_messages, build_rag_messages
+from .retrieval import (
+    CandidateSearcher,
+    NoOpReranker,
+    Reranker,
+    SemanticCandidateSearcher,
+    candidate_to_retrieved_chunk,
+    enhanced_retrieve,
+)
 from .search import semantic_search
 from .text_utils import OffsetTokenizer, RegexTokenizer
 
 
 ProgressCallback = Callable[[str], None]
+RAGMode = Literal["no_rag", "rag", "baseline_rag", "filtered_rag", "enhanced_rag"]
+
 
 class Retriever(Protocol):
-    """Интерфейс получения релевантных чанков."""
+    """Интерфейс получения релевантных чанков для Baseline RAG."""
 
     def retrieve(self, query: str, strategy: str, top_k: int) -> list[RetrievedChunk]:
-        """Найти релевантные чанки в порядке убывания сходства."""
+        """Найти релевантные чанки в порядке FAISS."""
 
 
 class RAGError(RuntimeError):
@@ -33,12 +42,12 @@ class RAGError(RuntimeError):
 
 
 class SemanticRetriever:
-    """Адаптер существующего семантического поиска для RAG."""
+    """Адаптер существующего семантического поиска без скрытого reranking."""
 
     def __init__(
         self,
         embedding_service: EmbeddingService | None = None,
-        min_score: float = 0.25,
+        min_score: float = -1.0,
         index_root: Path = INDEX_ROOT,
     ) -> None:
         if not -1.0 <= min_score <= 1.0:
@@ -53,52 +62,51 @@ class SemanticRetriever:
         return self.embedding_service.tokenizer
 
     def retrieve(self, query: str, strategy: str, top_k: int) -> list[RetrievedChunk]:
-        """Найти, дедуплицировать и по возможности разнообразить чанки."""
-        candidate_count = min(20, max(top_k * 3, top_k))
+        """Получить обычный Top-K FAISS; фильтр применяется только при явном min_score."""
         rows = semantic_search(
             query,
             strategy,
-            candidate_count,
+            top_k,
             embedding_service=self.embedding_service,
             index_root=self.index_root,
         )
-        candidates: list[RetrievedChunk] = []
-        seen_ids: set[str] = set()
-        for row in rows:
-            if float(row["score"]) < self.min_score:
-                continue
-            chunk_id = str(row["chunk_id"])
-            if chunk_id in seen_ids:
-                continue
-            seen_ids.add(chunk_id)
-            candidates.append(
-                RetrievedChunk(
-                    chunk_id=chunk_id,
-                    source=str(row["source"]),
-                    title=row.get("title"),
-                    section=row.get("section"),
-                    page_number=row.get("page_number"),
-                    content=str(row["content"]),
-                    score=float(row["score"]),
-                    token_count=int(row.get("token_count") or 0),
-                )
+        return [
+            RetrievedChunk(
+                chunk_id=str(row["chunk_id"]),
+                source=str(row["source"]),
+                title=row.get("title"),
+                section=row.get("section"),
+                page_number=row.get("page_number"),
+                content=str(row["content"]),
+                score=float(row["score"]),
+                token_count=int(row.get("token_count") or 0),
             )
-        selected: list[RetrievedChunk] = []
-        deferred: list[RetrievedChunk] = []
-        per_source: Counter[str] = Counter()
-        for chunk in candidates:
-            if per_source[chunk.source] >= 3:
-                deferred.append(chunk)
-                continue
-            selected.append(chunk)
-            per_source[chunk.source] += 1
-            if len(selected) == top_k:
-                return selected
-        for chunk in deferred:
-            selected.append(chunk)
-            if len(selected) == top_k:
-                break
-        return selected
+            for row in rows
+            if float(row["score"]) >= self.min_score
+        ]
+
+
+class _RetrieverCandidateAdapter:
+    def __init__(self, retriever: Retriever) -> None:
+        self.retriever = retriever
+
+    def search(self, query: str, strategy: str, top_k: int) -> list[dict[str, object]]:
+        return [
+            {
+                "rank": rank,
+                "score": chunk.score,
+                "chunk_id": chunk.chunk_id,
+                "source": chunk.source,
+                "title": chunk.title,
+                "section": chunk.section,
+                "page_number": chunk.page_number,
+                "content": chunk.content,
+                "token_count": chunk.token_count,
+            }
+            for rank, chunk in enumerate(
+                self.retriever.retrieve(query, strategy, top_k), start=1
+            )
+        ]
 
 
 def _count_tokens(text: str, tokenizer: OffsetTokenizer) -> int:
@@ -152,8 +160,7 @@ def build_context(
         token_total += block_tokens
     if not blocks:
         return "", []
-    context = prefix + "\n\n".join(blocks) + suffix
-    return context, used
+    return prefix + "\n\n".join(blocks) + suffix, used
 
 
 def _sources_from_chunks(chunks: list[RetrievedChunk]) -> list[dict[str, object]]:
@@ -189,25 +196,67 @@ def _ensure_source_references(answer: str, sources: list[dict[str, object]]) -> 
     return f"{answer.rstrip()}\n\nИсточники: {references}"
 
 
+def _empty_context_result(
+    *,
+    question: str,
+    mode: str,
+    model_name: str,
+    strategy: str,
+    top_k: int,
+    started: float,
+    retrieval_time: float,
+    diagnostics: dict[str, object],
+) -> AnswerResult:
+    return AnswerResult(
+        question=question,
+        answer=(
+            "Релевантный контекст в локальных документах не найден; "
+            "ответ по базе невозможен."
+        ),
+        mode=mode,
+        model_name=model_name,
+        strategy=strategy,
+        top_k=top_k,
+        retrieval_time=retrieval_time,
+        total_time=time.perf_counter() - started,
+        retrieval_mode=("baseline_rag" if mode == "rag" else mode),
+        original_query=question,
+        rewritten_query=diagnostics.get("rewritten_query"),
+        alternative_queries=list(diagnostics.get("alternative_queries", [])),
+        candidate_count=int(diagnostics.get("candidate_count", 0)),
+        accepted_count=int(diagnostics.get("accepted_count", 0)),
+        final_count=0,
+        rewrite_time=float(diagnostics.get("rewrite_time", 0.0)),
+        filter_time=float(diagnostics.get("filter_time", 0.0)),
+        rerank_time=float(diagnostics.get("rerank_time", 0.0)),
+        retrieval_diagnostics=diagnostics,
+    )
+
+
 def answer_question(
     question: str,
-    mode: Literal["rag", "no_rag"],
+    mode: RAGMode,
     llm: LLMProvider,
     strategy: str = "structural",
     top_k: int = 5,
     max_context_tokens: int = 4000,
     temperature: float = 0.1,
+    retrieval_config: RetrievalConfig | None = None,
     *,
     retriever: Retriever | None = None,
+    candidate_searcher: CandidateSearcher | None = None,
+    rewrite_llm: LLMProvider | None = None,
+    reranker: Reranker | None = None,
     tokenizer: OffsetTokenizer | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> AnswerResult:
-    """Ответить на вопрос в одном из двух сравниваемых режимов."""
+    """Ответить в одном из режимов, не передавая отклонённые чанки в LLM."""
     normalized_question = question.strip()
     if not normalized_question:
         raise ValueError("Вопрос не может быть пустым.")
-    if mode not in ("rag", "no_rag"):
-        raise ValueError("Режим должен быть rag или no_rag.")
+    allowed_modes = {"no_rag", "rag", "baseline_rag", "filtered_rag", "enhanced_rag"}
+    if mode not in allowed_modes:
+        raise ValueError("Неизвестный режим ответа.")
     if not 1 <= top_k <= 20:
         raise ValueError("top_k должен находиться в диапазоне от 1 до 20.")
     if max_context_tokens <= 0:
@@ -216,7 +265,8 @@ def answer_question(
         raise ValueError("Temperature должна находиться между 0 и 2.")
 
     started = time.perf_counter()
-    model_name = getattr(llm, "model_name", llm.__class__.__name__)
+    model_name = str(getattr(llm, "model_name", llm.__class__.__name__))
+    requested_top_k = top_k
     if mode == "no_rag":
         if progress_callback:
             progress_callback("no_rag_generation")
@@ -234,22 +284,95 @@ def answer_question(
             question=normalized_question,
             answer=answer.strip(),
             mode="no_rag",
-            model_name=str(model_name),
+            model_name=model_name,
             strategy=None,
             top_k=None,
             generation_time=generation_time,
             total_time=time.perf_counter() - started,
+            retrieval_mode="no_rag",
+            original_query=normalized_question,
         )
 
     retrieval_started = time.perf_counter()
-    if progress_callback:
-        progress_callback("query_embedding")
-    active_retriever = retriever or SemanticRetriever()
-    retrieved = active_retriever.retrieve(normalized_question, strategy, top_k)
+    diagnostics: dict[str, object]
+    active_tokenizer: OffsetTokenizer
+    if mode in {"rag", "baseline_rag"}:
+        if progress_callback:
+            progress_callback("query_embedding")
+        active_retriever = retriever or SemanticRetriever()
+        retrieved = active_retriever.retrieve(normalized_question, strategy, top_k)
+        retrieval_time = time.perf_counter() - retrieval_started
+        active_tokenizer = tokenizer or getattr(active_retriever, "tokenizer", RegexTokenizer())
+        diagnostics = {
+            "original_query": normalized_question,
+            "rewritten_query": None,
+            "alternative_queries": [],
+            "rewrite_used": False,
+            "fallback_reason": None,
+            "candidate_count": len(retrieved),
+            "accepted_count": len(retrieved),
+            "reranked_count": len(retrieved),
+            "final_count": len(retrieved),
+            "rewrite_time": 0.0,
+            "search_time": retrieval_time,
+            "filter_time": 0.0,
+            "rerank_time": 0.0,
+            "initial_candidates": [
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "source": chunk.source,
+                    "title": chunk.title,
+                    "section": chunk.section,
+                    "page_number": chunk.page_number,
+                    "content": chunk.content,
+                    "similarity": chunk.score,
+                    "original_rank": rank,
+                    "final_rank": rank,
+                    "status": "selected",
+                    "rejection_reason": None,
+                    "matched_queries": [normalized_question],
+                }
+                for rank, chunk in enumerate(retrieved, start=1)
+            ],
+        }
+    else:
+        config = retrieval_config or RetrievalConfig()
+        if mode == "filtered_rag":
+            config = replace(
+                config,
+                use_query_rewrite=False,
+                use_similarity_filter=True,
+                reranker_type="none",
+                rerank_threshold=None,
+                max_chunks_per_source=config.candidate_top_k,
+            )
+            reranker = NoOpReranker()
+        active_searcher = candidate_searcher
+        if active_searcher is None:
+            if retriever is not None:
+                active_searcher = _RetrieverCandidateAdapter(retriever)
+            else:
+                active_searcher = SemanticCandidateSearcher()
+        active_tokenizer = tokenizer or getattr(active_searcher, "tokenizer", RegexTokenizer())
+        if progress_callback and config.use_query_rewrite and mode == "enhanced_rag":
+            progress_callback("query_rewrite")
+        retrieval_result = enhanced_retrieve(
+            normalized_question,
+            strategy,
+            config,
+            (rewrite_llm or llm) if mode == "enhanced_rag" else None,
+            reranker,
+            searcher=active_searcher,
+        )
+        diagnostics = retrieval_result.to_dict(include_content=True)
+        retrieved = [
+            candidate_to_retrieved_chunk(candidate)
+            for candidate in retrieval_result.final_chunks
+        ]
+        retrieval_time = retrieval_result.total_retrieval_time
+
     if progress_callback:
         progress_callback("retrieval")
-    retrieval_time = time.perf_counter() - retrieval_started
-    active_tokenizer = tokenizer or getattr(active_retriever, "tokenizer", RegexTokenizer())
     context, used_chunks = build_context(
         retrieved,
         max_context_tokens,
@@ -258,17 +381,15 @@ def answer_question(
     if progress_callback:
         progress_callback("context")
     if not used_chunks:
-        return AnswerResult(
+        return _empty_context_result(
             question=normalized_question,
-            answer="Релевантный контекст в локальных документах не найден; ответ по базе невозможен.",
-            mode="rag",
-            model_name=str(model_name),
+            mode=mode,
+            model_name=model_name,
             strategy=strategy,
-            top_k=top_k,
-            retrieved_chunks=[],
-            sources=[],
+            top_k=(retrieval_config.final_top_k if retrieval_config and mode != "baseline_rag" else top_k),
+            started=started,
             retrieval_time=retrieval_time,
-            total_time=time.perf_counter() - started,
+            diagnostics=diagnostics,
         )
 
     generation_started = time.perf_counter()
@@ -288,16 +409,27 @@ def answer_question(
     return AnswerResult(
         question=normalized_question,
         answer=answer,
-        mode="rag",
-        model_name=str(model_name),
+        mode=mode,
+        model_name=model_name,
         strategy=strategy,
-        top_k=top_k,
+        top_k=requested_top_k,
         retrieved_chunks=used_chunks,
         sources=sources,
         context_token_count=_count_tokens(context, active_tokenizer),
         retrieval_time=retrieval_time,
         generation_time=generation_time,
         total_time=time.perf_counter() - started,
+        retrieval_mode=("baseline_rag" if mode == "rag" else mode),
+        original_query=normalized_question,
+        rewritten_query=diagnostics.get("rewritten_query"),
+        alternative_queries=list(diagnostics.get("alternative_queries", [])),
+        candidate_count=int(diagnostics.get("candidate_count", len(retrieved))),
+        accepted_count=int(diagnostics.get("accepted_count", len(retrieved))),
+        final_count=len(used_chunks),
+        rewrite_time=float(diagnostics.get("rewrite_time", 0.0)),
+        filter_time=float(diagnostics.get("filter_time", 0.0)),
+        rerank_time=float(diagnostics.get("rerank_time", 0.0)),
+        retrieval_diagnostics=diagnostics,
     )
 
 
@@ -313,7 +445,7 @@ def compare_answers(
     tokenizer: OffsetTokenizer | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[AnswerResult, AnswerResult]:
-    """Последовательно получить честную пару ответов одной LLM."""
+    """Сохранить совместимое сравнение no-RAG и прежнего Baseline RAG."""
     without_rag = answer_question(
         question,
         "no_rag",
@@ -337,3 +469,49 @@ def compare_answers(
         progress_callback=progress_callback,
     )
     return without_rag, with_rag
+
+
+def compare_retrieval_modes(
+    question: str,
+    llm: LLMProvider,
+    *,
+    strategy: str = "structural",
+    baseline_top_k: int = 5,
+    retrieval_config: RetrievalConfig | None = None,
+    max_context_tokens: int = 4000,
+    temperature: float = 0.1,
+    retriever: Retriever | None = None,
+    candidate_searcher: CandidateSearcher | None = None,
+    tokenizer: OffsetTokenizer | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[AnswerResult, AnswerResult]:
+    """Сравнить Baseline и Enhanced при одинаковой LLM и генерационных настройках."""
+    config = retrieval_config or RetrievalConfig()
+    baseline = answer_question(
+        question,
+        "baseline_rag",
+        llm,
+        strategy=strategy,
+        top_k=baseline_top_k,
+        max_context_tokens=max_context_tokens,
+        temperature=temperature,
+        retriever=retriever,
+        tokenizer=tokenizer,
+        progress_callback=progress_callback,
+    )
+    enhanced = answer_question(
+        question,
+        "enhanced_rag",
+        llm,
+        strategy=strategy,
+        top_k=config.final_top_k,
+        max_context_tokens=max_context_tokens,
+        temperature=temperature,
+        retrieval_config=config,
+        retriever=retriever,
+        candidate_searcher=candidate_searcher,
+        rewrite_llm=llm,
+        tokenizer=tokenizer,
+        progress_callback=progress_callback,
+    )
+    return baseline, enhanced

@@ -17,6 +17,7 @@ EVALUATION_DIR = PROJECT_ROOT / "evaluation"
 RAG_QUESTIONS_PATH = EVALUATION_DIR / "questions.json"
 RAG_RESULTS_PATH = EVALUATION_DIR / "results.json"
 RAG_REPORT_PATH = REPORT_DIR / "rag_comparison.md"
+RERANKING_REPORT_PATH = REPORT_DIR / "reranking_comparison.md"
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")

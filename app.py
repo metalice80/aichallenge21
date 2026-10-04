@@ -6,6 +6,7 @@ import hashlib
 import logging
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 import plotly.express as px
@@ -21,6 +22,7 @@ from src.config import (
     RAG_QUESTIONS_PATH,
     RAG_REPORT_PATH,
     RAG_RESULTS_PATH,
+    RERANKING_REPORT_PATH,
     RESULTS_DATABASE,
     STRATEGIES,
     SUPPORTED_EXTENSIONS,
@@ -38,14 +40,20 @@ from src.evaluation import (
 )
 from src.loaders import DocumentLoadError, load_document
 from src.llm import LLMError, OllamaProvider
-from src.models import AnswerResult
+from src.models import AnswerResult, RetrievalConfig
 from src.pipeline import build_indexes
-from src.rag import SemanticRetriever, compare_answers
-from src.rag_evaluation import (
-    aggregate_metrics,
-    load_questions,
-    run_benchmark,
-    write_rag_report,
+from src.rag import (
+    SemanticRetriever,
+    answer_question,
+    compare_retrieval_modes,
+)
+from src.rag_evaluation import load_questions
+from src.retrieval import SemanticCandidateSearcher
+from src.retrieval_evaluation import (
+    aggregate_reranking_metrics,
+    run_reranking_benchmark,
+    run_threshold_experiment,
+    write_reranking_report,
 )
 from src.result_storage import (
     ResultStorage,
@@ -135,89 +143,161 @@ def render_result(result: dict[str, Any]) -> None:
 def clear_current_rag_result() -> None:
     """Очистить только текущие несохранённые значения интерфейса."""
     st.session_state["rag-question"] = ""
-    st.session_state.pop("rag-pair", None)
+    st.session_state.pop("rag-results", None)
     st.session_state.pop("rag-run-id", None)
 
 
-def render_rag_pair(without_rag: AnswerResult, with_rag: AnswerResult) -> None:
-    """Показать два ответа, метрики, источники и найденные чанки."""
-    left, right = st.columns(2)
-    with left:
-        st.markdown("### Без RAG")
-        st.markdown(without_rag.answer)
-        st.caption(
-            f"Модель: {without_rag.model_name} · генерация: "
-            f"{without_rag.generation_time:.3f} с"
-        )
-        st.info("Локальные документы не использовались.")
-    with right:
-        st.markdown("### С RAG")
-        st.markdown(with_rag.answer)
-        st.caption(
-            f"Модель: {with_rag.model_name} · стратегия: {with_rag.strategy} · "
-            f"поиск: {with_rag.retrieval_time:.3f} с · "
-            f"генерация: {with_rag.generation_time:.3f} с"
-        )
-        if with_rag.sources:
-            st.markdown(
-                "**Источники:** "
-                + "; ".join(
-                    f"[{source['number']}] {source['source']}"
-                    + (f" — {source['section']}" if source.get("section") else "")
-                    for source in with_rag.sources
-                )
+def render_mode_answer(result: AnswerResult, label: str) -> None:
+    """Показать ответ и фактически переданный LLM контекст одного режима."""
+    st.markdown(f"### {label}")
+    st.markdown(result.answer)
+    st.caption(
+        f"Режим: {result.retrieval_mode} · модель: {result.model_name} · "
+        f"retrieval: {result.retrieval_time:.3f} с · "
+        f"генерация: {result.generation_time:.3f} с · всего: {result.total_time:.3f} с"
+    )
+    metric_a, metric_b, metric_c = st.columns(3)
+    metric_a.metric("Чанков в контексте", len(result.retrieved_chunks))
+    metric_b.metric("Источников", len(result.sources))
+    metric_c.metric("Контекст, токенов", result.context_token_count)
+    if result.sources:
+        st.markdown(
+            "**Источники:** "
+            + "; ".join(
+                f"[{source['number']}] {source['source']}"
+                + (f" — {source['section']}" if source.get("section") else "")
+                for source in result.sources
             )
-        else:
-            st.warning("Релевантные локальные источники отсутствуют.")
+        )
+    else:
+        st.warning("Релевантные локальные источники в LLM-контекст не передавались.")
 
+
+def render_retrieval_diagnostics(result: AnswerResult) -> None:
+    """Показать Query Rewrite, воронку и статусы всех Enhanced-кандидатов."""
+    diagnostics = result.retrieval_diagnostics
+    st.markdown("### Query Rewrite")
+    query_a, query_b = st.columns(2)
+    query_a.markdown(f"**Исходный вопрос**\n\n{result.original_query}")
+    query_b.markdown(
+        f"**Переписанный запрос**\n\n{result.rewritten_query or 'Не создан'}"
+    )
+    if result.alternative_queries:
+        st.markdown(
+            "**Альтернативные запросы:**\n"
+            + "\n".join(
+                f"{position}. {query}"
+                for position, query in enumerate(result.alternative_queries, start=1)
+            )
+        )
+    if diagnostics.get("fallback_reason"):
+        st.warning(f"Использован fallback: {diagnostics['fallback_reason']}")
+    else:
+        st.success(
+            "Query Rewrite использован."
+            if diagnostics.get("rewrite_used")
+            else "Query Rewrite выключен или не изменил запрос."
+        )
+    st.caption(f"Время rewrite: {result.rewrite_time:.4f} с")
+
+    st.markdown("### Retrieval funnel")
+    funnel_a, funnel_b, funnel_c, funnel_d = st.columns(4)
+    funnel_a.metric("FAISS-кандидаты", diagnostics.get("candidate_count", 0))
+    funnel_b.metric("После similarity", diagnostics.get("accepted_count", 0))
+    funnel_c.metric("После reranking", diagnostics.get("reranked_count", 0))
+    funnel_d.metric("Final Top-K", diagnostics.get("final_count", 0))
     st.dataframe(
         pd.DataFrame(
             [
                 {
-                    "Показатель": "Время поиска, с",
-                    "Без RAG": 0.0,
-                    "С RAG": round(with_rag.retrieval_time, 4),
+                    "Этап": "Query Rewrite",
+                    "Время, с": round(float(diagnostics.get("rewrite_time", 0.0)), 4),
                 },
                 {
-                    "Показатель": "Время генерации, с",
-                    "Без RAG": round(without_rag.generation_time, 4),
-                    "С RAG": round(with_rag.generation_time, 4),
+                    "Этап": "FAISS-поиск",
+                    "Время, с": round(float(diagnostics.get("search_time", 0.0)), 4),
                 },
                 {
-                    "Показатель": "Найдено чанков",
-                    "Без RAG": 0,
-                    "С RAG": len(with_rag.retrieved_chunks),
+                    "Этап": "Similarity-фильтр",
+                    "Время, с": round(float(diagnostics.get("filter_time", 0.0)), 4),
                 },
                 {
-                    "Показатель": "Источников",
-                    "Без RAG": 0,
-                    "С RAG": len(with_rag.sources),
+                    "Этап": "Reranking",
+                    "Время, с": round(float(diagnostics.get("rerank_time", 0.0)), 4),
                 },
                 {
-                    "Показатель": "Контекст, токенов",
-                    "Без RAG": 0,
-                    "С RAG": with_rag.context_token_count,
+                    "Этап": "Полный retrieval",
+                    "Время, с": round(result.retrieval_time, 4),
                 },
             ]
         ),
         width="stretch",
         hide_index=True,
     )
-    with st.expander(
-        f"Найденные чанки и similarity score ({len(with_rag.retrieved_chunks)})"
-    ):
-        if not with_rag.retrieved_chunks:
-            st.info("Чанки не найдены.")
-        for position, chunk in enumerate(with_rag.retrieved_chunks, start=1):
-            page = chunk.page_number if chunk.page_number is not None else "—"
-            st.markdown(
-                f"**Источник [{chunk.source_number or position}] · "
-                f"similarity `{chunk.score:.4f}`**  \n"
-                f"Файл: `{chunk.source}` · Заголовок: `{chunk.title or '—'}` · "
-                f"Раздел: `{chunk.section or '—'}` · Страница: `{page}`  \n"
-                f"Chunk ID: `{chunk.chunk_id}`"
+
+    candidates = diagnostics.get("initial_candidates", [])
+    st.markdown("### Кандидаты до и после фильтрации")
+    if not candidates:
+        st.warning("FAISS не вернул кандидатов.")
+        return
+    statuses = sorted({str(item.get("status", "candidate")) for item in candidates})
+    selected_statuses = st.multiselect(
+        "Фильтр статусов",
+        statuses,
+        default=statuses,
+        key="rag-candidate-statuses",
+    )
+    visible = [item for item in candidates if item.get("status") in selected_statuses]
+    rows = [
+        {
+            "Rank до": item.get("original_rank"),
+            "Rank после": item.get("final_rank"),
+            "Источник": item.get("source"),
+            "Section": item.get("section") or "—",
+            "Similarity": item.get("similarity"),
+            "Fusion": item.get("fusion_score"),
+            "Semantic": item.get("semantic_score"),
+            "Lexical": item.get("lexical_score"),
+            "Metadata": item.get("metadata_score"),
+            "Rerank": item.get("rerank_score"),
+            "Final": item.get("final_score"),
+            "Статус": item.get("status"),
+            "Причина": item.get("rejection_reason") or "—",
+            "Chunk ID": item.get("chunk_id"),
+        }
+        for item in visible
+    ]
+
+    def color_candidate_status(row: pd.Series) -> list[str]:
+        status = str(row["Статус"])
+        color = (
+            "#d8f3dc"
+            if status == "selected"
+            else "#fff3bf"
+            if status == "accepted_not_selected"
+            else "#e9ecef"
+            if status == "duplicate"
+            else "#ffe3e3"
+        )
+        return [f"background-color: {color}"] * len(row)
+
+    if rows:
+        st.dataframe(
+            pd.DataFrame(rows).style.apply(color_candidate_status, axis=1),
+            width="stretch",
+            hide_index=True,
+        )
+    for item in visible:
+        with st.expander(
+            f"{item.get('status')} · {item.get('source')} · "
+            f"{item.get('chunk_id')}"
+        ):
+            st.write(item.get("rejection_reason") or "Кандидат не отклонён.")
+            st.caption(
+                "Найден по запросам: "
+                + ", ".join(item.get("matched_queries", []))
             )
-            st.code(chunk.content, language=None, wrap_lines=True)
+            st.code(item.get("content", ""), language=None, wrap_lines=True)
 
 
 with st.sidebar:
@@ -549,38 +629,107 @@ with tab_analytics:
 
 
 with tab_rag:
-    st.subheader("Сравнение ответов с RAG и без RAG")
+    st.subheader("Сравнение Baseline RAG и Enhanced RAG")
     st.caption(
-        "Одна локальная Ollama-модель получает один вопрос, одинаковую temperature "
-        "и одинаковый стиль ответа. Отличается только наличие контекста."
+        "Одинаковые документы, embedding-модель, LLM, temperature и бюджет контекста. "
+        "Различаются только retrieval-настройки."
     )
     rag_question = st.text_area(
         "Вопрос",
         height=100,
         key="rag-question",
-        placeholder="Например: Как обеспечивается соответствие FAISS и SQLite?",
+        placeholder="Например: Какая функция загружает PDF-файлы?",
     )
     rag_model = st.text_input("Модель Ollama", value=OLLAMA_MODEL, key="rag-model")
     st.caption(f"Локальный сервер: `{OLLAMA_BASE_URL}`")
-    rag_a, rag_b, rag_c, rag_d = st.columns(4)
+    rag_a, rag_b = st.columns(2)
     rag_strategy = rag_a.selectbox("Индекс RAG", STRATEGIES, index=1, key="rag-strategy")
-    rag_top_k = rag_b.slider("top_k", 1, 20, 5, key="rag-top-k")
-    rag_max_tokens = rag_c.number_input(
-        "Контекст, токенов",
-        min_value=100,
-        max_value=16_000,
-        value=4000,
-        step=100,
-        key="rag-max-context",
-    )
-    rag_temperature = rag_d.slider(
-        "Temperature",
-        min_value=0.0,
-        max_value=2.0,
-        value=0.1,
-        step=0.1,
-        key="rag-temperature",
-    )
+    baseline_top_k = rag_b.slider("Baseline Top-K", 1, 20, 5, key="baseline-top-k")
+
+    with st.expander("Расширенные настройки Enhanced RAG", expanded=True):
+        setting_a, setting_b, setting_c = st.columns(3)
+        use_rewrite = setting_a.checkbox("Query Rewrite", value=True, key="use-query-rewrite")
+        max_alternatives = setting_b.slider(
+            "Альтернативных запросов", 0, 3, 2, key="max-alternative-queries"
+        )
+        candidate_top_k = setting_c.slider(
+            "Candidate Top-K", 1, 20, 20, key="candidate-top-k"
+        )
+        setting_d, setting_e, setting_f = st.columns(3)
+        similarity_threshold = setting_d.slider(
+            "Similarity threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.35,
+            step=0.01,
+            key="similarity-threshold",
+        )
+        reranker_label = setting_e.selectbox(
+            "Reranker",
+            ["Heuristic", "NoOp"],
+            key="reranker-type",
+        )
+        if st.session_state.get("final-top-k", 1) > int(candidate_top_k):
+            st.session_state["final-top-k"] = int(candidate_top_k)
+        final_top_k = setting_f.slider(
+            "Final Top-K",
+            1,
+            int(candidate_top_k),
+            min(5, int(candidate_top_k)),
+            key="final-top-k",
+        )
+        setting_g, setting_h, setting_i = st.columns(3)
+        max_per_source = setting_g.number_input(
+            "Максимум чанков источника",
+            min_value=1,
+            max_value=20,
+            value=3,
+            key="max-chunks-per-source",
+        )
+        rag_max_tokens = setting_h.number_input(
+            "Контекст, токенов",
+            min_value=100,
+            max_value=16_000,
+            value=4000,
+            step=100,
+            key="rag-max-context",
+        )
+        rag_temperature = setting_i.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            value=0.1,
+            step=0.1,
+            key="rag-temperature",
+        )
+        use_rerank_threshold = st.checkbox(
+            "Применить отдельный rerank threshold",
+            value=False,
+            key="use-rerank-threshold",
+        )
+        rerank_threshold = (
+            st.slider(
+                "Rerank threshold",
+                0.0,
+                1.0,
+                0.35,
+                0.01,
+                key="rerank-threshold",
+            )
+            if use_rerank_threshold
+            else None
+        )
+        include_no_rag = st.checkbox(
+            "Добавить режим без RAG",
+            value=False,
+            key="include-no-rag",
+        )
+        include_filtered_rag = st.checkbox(
+            "Добавить Filtered RAG",
+            value=False,
+            key="include-filtered-rag",
+        )
+
     connection_column, compare_column, clear_column = st.columns(3)
     if connection_column.button("Проверить Ollama", key="check-ollama"):
         try:
@@ -591,10 +740,10 @@ with tab_rag:
         except ValueError as exc:
             st.error(str(exc))
     compare_pressed = compare_column.button(
-        "Сравнить ответы",
+        "Сравнить режимы",
         type="primary",
         disabled=not rag_question.strip(),
-        key="compare-rag-answers",
+        key="compare-rag-modes",
     )
     clear_column.button(
         "Очистить текущий результат",
@@ -606,10 +755,11 @@ with tab_rag:
         status = st.status("Выполнение RAG-сравнения", expanded=True)
         stage_labels = {
             "no_rag_generation": "✓ Ответ без RAG",
-            "query_embedding": "✓ Генерация embedding вопроса",
-            "retrieval": "✓ Поиск релевантных чанков",
+            "query_rewrite": "✓ Query Rewrite",
+            "query_embedding": "✓ Генерация embedding исходного вопроса",
+            "retrieval": "✓ Поиск, фильтрация и reranking",
             "context": "✓ Формирование контекста",
-            "rag_generation": "✓ Ответ с RAG",
+            "rag_generation": "✓ Генерация ответа",
         }
         try:
             provider = OllamaProvider(rag_model, OLLAMA_BASE_URL, OLLAMA_TIMEOUT)
@@ -617,59 +767,132 @@ with tab_rag:
             if not connected:
                 raise LLMError(message)
             status.write("✓ Проверка подключения к LLM")
-            retriever = SemanticRetriever(get_embedding_service())
-            without_rag, with_rag = compare_answers(
+            embedding_service = get_embedding_service()
+            retriever = SemanticRetriever(embedding_service)
+            candidate_searcher = SemanticCandidateSearcher(embedding_service)
+            retrieval_config = RetrievalConfig(
+                candidate_top_k=int(candidate_top_k),
+                final_top_k=int(final_top_k),
+                similarity_threshold=float(similarity_threshold),
+                rerank_threshold=(
+                    float(rerank_threshold) if rerank_threshold is not None else None
+                ),
+                use_query_rewrite=bool(use_rewrite),
+                reranker_type=("heuristic" if reranker_label == "Heuristic" else "none"),
+                max_alternative_queries=int(max_alternatives),
+                max_chunks_per_source=int(max_per_source),
+            )
+            baseline_result, enhanced_result = compare_retrieval_modes(
                 rag_question,
                 provider,
                 strategy=rag_strategy,
-                top_k=int(rag_top_k),
+                baseline_top_k=int(baseline_top_k),
+                retrieval_config=retrieval_config,
                 max_context_tokens=int(rag_max_tokens),
                 temperature=float(rag_temperature),
                 retriever=retriever,
-                tokenizer=retriever.tokenizer,
+                candidate_searcher=candidate_searcher,
+                tokenizer=embedding_service.tokenizer,
                 progress_callback=lambda stage: status.write(stage_labels[stage]),
             )
-            run_id = result_storage.save_comparison(
-                without_rag,
-                with_rag,
+            results = [baseline_result, enhanced_result]
+            if include_filtered_rag:
+                results.insert(
+                    1,
+                    answer_question(
+                        rag_question,
+                        "filtered_rag",
+                        provider,
+                        strategy=rag_strategy,
+                        max_context_tokens=int(rag_max_tokens),
+                        temperature=float(rag_temperature),
+                        retrieval_config=retrieval_config,
+                        candidate_searcher=candidate_searcher,
+                        tokenizer=embedding_service.tokenizer,
+                        progress_callback=lambda stage: status.write(
+                            stage_labels[stage]
+                        ),
+                    ),
+                )
+            if include_no_rag:
+                results.insert(
+                    0,
+                    answer_question(
+                        rag_question,
+                        "no_rag",
+                        provider,
+                        max_context_tokens=int(rag_max_tokens),
+                        temperature=float(rag_temperature),
+                        progress_callback=lambda stage: status.write(stage_labels[stage]),
+                    ),
+                )
+            run_id = result_storage.save_mode_comparison(
+                results,
                 strategy=rag_strategy,
-                top_k=int(rag_top_k),
+                baseline_top_k=int(baseline_top_k),
                 max_context_tokens=int(rag_max_tokens),
                 temperature=float(rag_temperature),
+                retrieval_config=retrieval_config,
             )
-            st.session_state["rag-pair"] = (without_rag, with_rag)
+            st.session_state["rag-results"] = results
             st.session_state["rag-run-id"] = run_id
-            status.update(label="RAG-сравнение завершено и сохранено", state="complete")
+            status.update(label="Сравнение завершено и сохранено", state="complete")
         except Exception as exc:
-            logger.exception("Ошибка RAG-сравнения без записи контекста")
+            logger.exception("Ошибка RAG-сравнения без записи контекста в лог")
             status.update(label="RAG-сравнение остановлено", state="error")
             st.error(str(exc))
 
-    rag_pair = st.session_state.get("rag-pair")
-    if rag_pair:
-        without_rag_result, with_rag_result = rag_pair
-        render_rag_pair(without_rag_result, with_rag_result)
+    rag_results = st.session_state.get("rag-results")
+    if rag_results:
+        labels = {
+            "no_rag": "Без RAG",
+            "baseline_rag": "Baseline RAG",
+            "filtered_rag": "Filtered RAG",
+            "enhanced_rag": "Enhanced RAG",
+        }
+        result_tabs = st.tabs([labels.get(result.mode, result.mode) for result in rag_results])
+        for result_tab, result in zip(result_tabs, rag_results, strict=True):
+            with result_tab:
+                render_mode_answer(result, labels.get(result.mode, result.mode))
+        enhanced_result = next(
+            (result for result in rag_results if result.mode == "enhanced_rag"),
+            None,
+        )
+        if enhanced_result:
+            render_retrieval_diagnostics(enhanced_result)
+
         current_run_id = st.session_state.get("rag-run-id")
         if current_run_id:
             st.markdown("### Ручная оценка")
             preference_labels = {
+                "Baseline RAG": "baseline_rag",
+                "Enhanced RAG": "enhanced_rag",
+                "Filtered RAG": "filtered_rag",
                 "Без RAG": "no_rag",
-                "С RAG": "rag",
                 "Одинаково": "equal",
-                "Оба неверны": "both_wrong",
+                "Все неверны": "all_incorrect",
+            }
+            available_modes = {result.mode for result in rag_results}
+            preference_labels = {
+                label: value
+                for label, value in preference_labels.items()
+                if value in available_modes or value in {"equal", "all_incorrect"}
             }
             with st.form(f"manual-evaluation-{current_run_id}"):
                 evaluation_a, evaluation_b, evaluation_c = st.columns(3)
                 preferred_label = evaluation_a.selectbox(
-                    "Какой ответ лучше", list(preference_labels)
+                    "Какой режим лучше", list(preference_labels)
                 )
-                score_without = evaluation_b.select_slider(
-                    "Оценка без RAG", options=[0, 1, 2], value=1
+                score_baseline = evaluation_b.select_slider(
+                    "Оценка Baseline RAG", options=[0, 1, 2], value=1
                 )
-                score_with = evaluation_c.select_slider(
-                    "Оценка с RAG", options=[0, 1, 2], value=1
+                score_enhanced = evaluation_c.select_slider(
+                    "Оценка Enhanced RAG", options=[0, 1, 2], value=1
                 )
+                correct_sources = st.checkbox("Использованы правильные источники")
+                irrelevant_sources = st.checkbox("Есть нерелевантные источники")
                 unsupported = st.checkbox("Есть неподтверждённые утверждения")
+                rewrite_improved = st.checkbox("Query Rewrite улучшил поиск")
                 evaluation_comment = st.text_area("Комментарий")
                 save_evaluation = st.form_submit_button("Сохранить оценку")
             if save_evaluation:
@@ -677,9 +900,12 @@ with tab_rag:
                     result_storage.save_manual_evaluation(
                         int(current_run_id),
                         preferred_mode=preference_labels[preferred_label],
-                        score_without_rag=int(score_without),
-                        score_with_rag=int(score_with),
+                        score_baseline_rag=int(score_baseline),
+                        score_enhanced_rag=int(score_enhanced),
+                        correct_sources=correct_sources,
+                        has_irrelevant_sources=irrelevant_sources,
                         has_unsupported_claims=unsupported,
+                        rewrite_improved=rewrite_improved,
                         comment=evaluation_comment,
                     )
                     st.success("Ручная оценка сохранена без создания дубликата.")
@@ -701,10 +927,11 @@ with tab_rag:
                             "Дата": row["created_at"],
                             "Вопрос": row["question"][:100],
                             "Модель": row["model_name"],
-                            "Стратегия": row["strategy"],
-                            "top_k": row["top_k"],
-                            "Без RAG": row["answer_without_rag"][:120],
-                            "С RAG": row["answer_with_rag"][:120],
+                            "Режимы": row["retrieval_mode"] or "Day 22",
+                            "Rewritten query": row["rewritten_query"] or "—",
+                            "Fallback": row["rewrite_fallback_reason"] or "—",
+                            "Baseline": row["answer_baseline_rag"][:120],
+                            "Enhanced": row["answer_enhanced_rag"][:120],
                             "Оценка": row["preferred_mode"] or "—",
                         }
                         for row in history
@@ -720,15 +947,77 @@ with tab_rag:
             if st.button("Показать подробности", key="show-rag-history"):
                 details = result_storage.get_run(int(selected_history_id))
                 if details:
-                    st.json(details)
+                    st.markdown("#### Восстановленная retrieval-диагностика")
+                    st.write(f"Исходный запрос: {details['original_query']}")
+                    st.write(
+                        "Rewritten query: "
+                        f"{details['rewritten_query'] or 'не использован'}"
+                    )
+                    if details["rewrite_fallback_reason"]:
+                        st.warning(
+                            f"Query Rewrite fallback: "
+                            f"{details['rewrite_fallback_reason']}"
+                        )
+                    restored_funnel = pd.DataFrame(
+                        [
+                            {
+                                "Этап": "Candidates",
+                                "Количество": details["initial_candidate_count"],
+                            },
+                            {
+                                "Этап": "Accepted",
+                                "Количество": details["accepted_candidate_count"],
+                            },
+                            {
+                                "Этап": "Final",
+                                "Количество": details["final_candidate_count"],
+                            },
+                        ]
+                    )
+                    st.plotly_chart(
+                        px.bar(
+                            restored_funnel,
+                            x="Этап",
+                            y="Количество",
+                            title="Восстановленный retrieval funnel",
+                        ),
+                        width="stretch",
+                    )
+                    if details["retrieval_candidates"]:
+                        st.dataframe(
+                            pd.DataFrame(details["retrieval_candidates"]),
+                            width="stretch",
+                            hide_index=True,
+                        )
+                    st.json(details["answers"])
     except Exception as exc:
         logger.exception("Ошибка чтения истории RAG")
         st.error(f"История недоступна: {exc}")
 
 
 with tab_rag_evaluation:
-    st.subheader("Автоматическая оценка RAG")
+    st.subheader("Оценка Baseline и Enhanced RAG")
     try:
+        if "reranking-benchmark-results" not in st.session_state:
+            restored_benchmark = result_storage.latest_reranking_results()
+            if restored_benchmark:
+                stored_config = restored_benchmark[0]["result"].get(
+                    "parameters", {}
+                ).get("retrieval_config")
+                if stored_config:
+                    st.session_state["reranking-benchmark-config"] = (
+                        RetrievalConfig(**stored_config)
+                    )
+                st.session_state["reranking-benchmark-results"] = [
+                    row["result"] for row in restored_benchmark
+                ]
+                st.session_state["rag-benchmark-batch"] = restored_benchmark[0][
+                    "batch_id"
+                ]
+        if "threshold-results" not in st.session_state:
+            restored_thresholds = result_storage.latest_threshold_results()
+            if restored_thresholds:
+                st.session_state["threshold-results"] = restored_thresholds
         benchmark_questions = load_questions(RAG_QUESTIONS_PATH)
         st.caption(f"Контрольных вопросов: {len(benchmark_questions)}")
         st.dataframe(
@@ -751,12 +1040,57 @@ with tab_rag_evaluation:
             "Модель оценки", value=OLLAMA_MODEL, key="benchmark-model"
         )
         benchmark_strategy = benchmark_b.selectbox(
-            "Стратегия оценки", STRATEGIES, index=1, key="benchmark-strategy"
+            "Индекс оценки", STRATEGIES, index=1, key="benchmark-strategy"
         )
-        benchmark_top_k = benchmark_c.slider(
-            "top_k оценки", 1, 20, 5, key="benchmark-top-k"
+        benchmark_candidate_top_k = benchmark_c.slider(
+            "Candidate Top-K оценки", 1, 20, 20, key="benchmark-candidate-top-k"
         )
-        if st.button("Запустить оценку", type="primary", key="run-rag-benchmark"):
+        benchmark_d, benchmark_e, benchmark_f = st.columns(3)
+        benchmark_threshold = benchmark_d.slider(
+            "Similarity threshold оценки",
+            0.0,
+            1.0,
+            0.35,
+            0.01,
+            key="benchmark-threshold",
+        )
+        if st.session_state.get("benchmark-final-top-k", 1) > int(
+            benchmark_candidate_top_k
+        ):
+            st.session_state["benchmark-final-top-k"] = int(
+                benchmark_candidate_top_k
+            )
+        benchmark_final_top_k = benchmark_e.slider(
+            "Final Top-K оценки",
+            1,
+            int(benchmark_candidate_top_k),
+            min(5, int(benchmark_candidate_top_k)),
+            key="benchmark-final-top-k",
+        )
+        benchmark_rewrite = benchmark_f.checkbox(
+            "Query Rewrite в Enhanced",
+            value=True,
+            key="benchmark-rewrite",
+        )
+        benchmark_reranker_label = st.selectbox(
+            "Reranker оценки",
+            ("Heuristic", "NoOp"),
+            key="benchmark-reranker",
+        )
+        threshold_values_text = st.text_input(
+            "Threshold experiment — значения через запятую",
+            value="0.20, 0.30, 0.35, 0.40, 0.50",
+            key="threshold-values",
+        )
+        st.caption(
+            "Threshold experiment изолирует влияние порога: Query Rewrite в нём выключен."
+        )
+        run_benchmark_button, run_threshold_button = st.columns(2)
+        if run_benchmark_button.button(
+            "Запустить сравнение 10 вопросов",
+            type="primary",
+            key="run-reranking-benchmark",
+        ):
             try:
                 provider = OllamaProvider(
                     benchmark_model, OLLAMA_BASE_URL, OLLAMA_TIMEOUT
@@ -765,43 +1099,198 @@ with tab_rag_evaluation:
                 if not connected:
                     raise LLMError(message)
                 progress = st.progress(0.0, text="Подготовка контрольного прогона")
-                retriever = SemanticRetriever(get_embedding_service())
+                embedding_service = get_embedding_service()
+                retriever = SemanticRetriever(embedding_service)
+                candidate_searcher = SemanticCandidateSearcher(embedding_service)
+                benchmark_config = RetrievalConfig(
+                    candidate_top_k=int(benchmark_candidate_top_k),
+                    final_top_k=int(benchmark_final_top_k),
+                    similarity_threshold=float(benchmark_threshold),
+                    use_query_rewrite=bool(benchmark_rewrite),
+                    reranker_type=(
+                        "heuristic"
+                        if benchmark_reranker_label == "Heuristic"
+                        else "none"
+                    ),
+                    max_alternative_queries=2,
+                    max_chunks_per_source=3,
+                )
 
-                def update_benchmark(position: int, total: int, question_id: str) -> None:
+                def update_reranking_benchmark(
+                    position: int,
+                    total: int,
+                    question_id: str,
+                    stage: str,
+                ) -> None:
                     progress.progress(
                         position / total,
-                        text=f"{question_id}: {position} из {total}",
+                        text=f"{question_id}: {stage} · {position} из {total}",
                     )
 
-                batch_id, benchmark_results = run_benchmark(
+                batch_id, benchmark_results = run_reranking_benchmark(
                     benchmark_questions,
                     provider,
                     result_storage,
                     strategy=benchmark_strategy,
-                    top_k=int(benchmark_top_k),
+                    baseline_top_k=5,
+                    config=benchmark_config,
                     retriever=retriever,
-                    tokenizer=retriever.tokenizer,
-                    progress_callback=update_benchmark,
+                    candidate_searcher=candidate_searcher,
+                    tokenizer=embedding_service.tokenizer,
+                    progress_callback=update_reranking_benchmark,
                 )
-                report_path = write_rag_report(
+                report_path = write_reranking_report(
                     benchmark_results,
                     model_name=benchmark_model,
                     strategy=benchmark_strategy,
-                    top_k=int(benchmark_top_k),
-                    temperature=0.1,
-                    path=RAG_REPORT_PATH,
+                    config=benchmark_config,
+                    threshold_results=st.session_state.get("threshold-results"),
+                    path=RERANKING_REPORT_PATH,
                 )
-                st.session_state["rag-benchmark-results"] = benchmark_results
+                st.session_state["reranking-benchmark-results"] = benchmark_results
+                st.session_state["reranking-benchmark-config"] = benchmark_config
                 st.session_state["rag-benchmark-batch"] = batch_id
                 st.success(f"Оценка завершена. Отчёт: {report_path}")
             except Exception as exc:
-                logger.exception("Ошибка автоматической оценки RAG")
+                logger.exception("Ошибка автоматической оценки reranking")
                 st.error(f"Оценка не выполнена: {exc}")
 
-        current_benchmark = st.session_state.get("rag-benchmark-results")
+        if run_threshold_button.button(
+            "Запустить threshold experiment",
+            key="run-threshold-experiment",
+        ):
+            try:
+                threshold_values = [
+                    float(value.strip())
+                    for value in threshold_values_text.split(",")
+                    if value.strip()
+                ]
+                embedding_service = get_embedding_service()
+                benchmark_config = RetrievalConfig(
+                    candidate_top_k=int(benchmark_candidate_top_k),
+                    final_top_k=int(benchmark_final_top_k),
+                    similarity_threshold=float(benchmark_threshold),
+                    use_query_rewrite=False,
+                    reranker_type=(
+                        "heuristic"
+                        if benchmark_reranker_label == "Heuristic"
+                        else "none"
+                    ),
+                )
+                threshold_results = run_threshold_experiment(
+                    benchmark_questions,
+                    threshold_values,
+                    strategy=benchmark_strategy,
+                    config=benchmark_config,
+                    rewrite_llm=None,
+                    searcher=SemanticCandidateSearcher(embedding_service),
+                )
+                threshold_batch_id = f"threshold-{uuid4().hex}"
+                for item in threshold_results:
+                    result_storage.save_benchmark_result(
+                        threshold_batch_id,
+                        f"threshold-{item['threshold']}",
+                        {
+                            "type": "threshold_experiment",
+                            "strategy": benchmark_strategy,
+                            "model_name": benchmark_model,
+                            "config": {
+                                "candidate_top_k": benchmark_config.candidate_top_k,
+                                "final_top_k": benchmark_config.final_top_k,
+                                "reranker_type": benchmark_config.reranker_type,
+                            },
+                            "metrics": item,
+                        },
+                    )
+                st.session_state["threshold-results"] = threshold_results
+                current_benchmark = st.session_state.get(
+                    "reranking-benchmark-results"
+                )
+                if current_benchmark:
+                    write_reranking_report(
+                        current_benchmark,
+                        model_name=benchmark_model,
+                        strategy=benchmark_strategy,
+                        config=st.session_state.get(
+                            "reranking-benchmark-config", benchmark_config
+                        ),
+                        threshold_results=threshold_results,
+                        path=RERANKING_REPORT_PATH,
+                    )
+                st.success("Эксперимент с порогами завершён.")
+            except Exception as exc:
+                logger.exception("Ошибка threshold experiment")
+                st.error(f"Эксперимент не выполнен: {exc}")
+
+        current_benchmark = st.session_state.get("reranking-benchmark-results")
         if current_benchmark:
-            st.markdown("### Итоговые метрики")
-            st.json(aggregate_metrics(current_benchmark))
+            st.markdown("### Итоговые retrieval-метрики")
+            aggregate = aggregate_reranking_metrics(current_benchmark)
+            st.json(aggregate)
+            chart_rows = [
+                {
+                    "Метрика": metric,
+                    "Baseline": aggregate[f"baseline_{metric}"],
+                    "Enhanced": aggregate[f"enhanced_{metric}"],
+                }
+                for metric in ("hit_at_1", "hit_at_3", "hit_at_k", "mrr", "precision_at_k")
+            ]
+            st.plotly_chart(
+                px.bar(
+                    pd.DataFrame(chart_rows),
+                    x="Метрика",
+                    y=["Baseline", "Enhanced"],
+                    barmode="group",
+                    title="Retrieval-качество Baseline и Enhanced",
+                ),
+                width="stretch",
+            )
+            detail_rows = [
+                {
+                    "Метрика": "Первая релевантная позиция",
+                    "Baseline": aggregate["baseline_mean_first_relevant_rank"],
+                    "Enhanced": aggregate["enhanced_mean_first_relevant_rank"],
+                },
+                {
+                    "Метрика": "Keyword coverage ответа",
+                    "Baseline": aggregate["baseline_keyword_coverage"],
+                    "Enhanced": aggregate["enhanced_keyword_coverage"],
+                },
+            ]
+            st.plotly_chart(
+                px.bar(
+                    pd.DataFrame(detail_rows),
+                    x="Метрика",
+                    y=["Baseline", "Enhanced"],
+                    barmode="group",
+                    title="Позиция релевантного источника и качество ответа",
+                ),
+                width="stretch",
+            )
+            timing_frame = pd.DataFrame(
+                [
+                    {"Этап": "Rewrite", "Секунды": aggregate["mean_rewrite_time"]},
+                    {"Этап": "Filter", "Секунды": aggregate["mean_filter_time"]},
+                    {"Этап": "Rerank", "Секунды": aggregate["mean_rerank_time"]},
+                    {
+                        "Этап": "Retrieval total",
+                        "Секунды": aggregate["mean_total_retrieval_time"],
+                    },
+                ]
+            )
+            st.plotly_chart(
+                px.bar(
+                    timing_frame,
+                    x="Этап",
+                    y="Секунды",
+                    title="Среднее время этапов Enhanced Retrieval",
+                ),
+                width="stretch",
+            )
+            st.metric(
+                "Вопросов, где Enhanced Retrieval лучше",
+                aggregate["enhanced_better_question_count"],
+            )
             benchmark_labels = {
                 f"{result['question']['id']}: {result['question']['question']}": result
                 for result in current_benchmark
@@ -816,11 +1305,73 @@ with tab_rag_evaluation:
                 st.error(selected_result["error"])
             else:
                 benchmark_left, benchmark_right = st.columns(2)
-                benchmark_left.markdown("**Без RAG**")
-                benchmark_left.write(selected_result["without_rag"]["answer"])
-                benchmark_right.markdown("**С RAG**")
-                benchmark_right.write(selected_result["with_rag"]["answer"])
+                benchmark_left.markdown("**Baseline RAG**")
+                benchmark_left.write(selected_result["baseline"]["answer"])
+                benchmark_right.markdown("**Enhanced RAG**")
+                benchmark_right.write(selected_result["enhanced"]["answer"])
                 st.json(selected_result["metrics"])
+                diagnostics = selected_result["enhanced"].get(
+                    "retrieval_diagnostics", {}
+                )
+                funnel = pd.DataFrame(
+                    [
+                        {
+                            "Этап": "Candidates",
+                            "Количество": diagnostics.get("candidate_count", 0),
+                        },
+                        {
+                            "Этап": "Accepted",
+                            "Количество": diagnostics.get("accepted_count", 0),
+                        },
+                        {
+                            "Этап": "Reranked",
+                            "Количество": diagnostics.get("reranked_count", 0),
+                        },
+                        {
+                            "Этап": "Final",
+                            "Количество": diagnostics.get("final_count", 0),
+                        },
+                    ]
+                )
+                st.plotly_chart(
+                    px.bar(
+                        funnel,
+                        x="Этап",
+                        y="Количество",
+                        title="Retrieval funnel выбранного вопроса",
+                    ),
+                    width="stretch",
+                )
+                candidate_rows = diagnostics.get("initial_candidates", [])
+                if candidate_rows:
+                    candidate_frame = pd.DataFrame(candidate_rows)
+                    st.plotly_chart(
+                        px.scatter(
+                            candidate_frame,
+                            x="original_rank",
+                            y="similarity",
+                            color="status",
+                            hover_data=["chunk_id", "source"],
+                            title="Similarity принятых и отброшенных кандидатов",
+                        ),
+                        width="stretch",
+                    )
+
+        threshold_results = st.session_state.get("threshold-results")
+        if threshold_results:
+            st.markdown("### Зависимость качества от similarity threshold")
+            threshold_frame = pd.DataFrame(threshold_results)
+            st.dataframe(threshold_frame, width="stretch", hide_index=True)
+            st.plotly_chart(
+                px.line(
+                    threshold_frame,
+                    x="threshold",
+                    y=["source_hit_at_k", "precision_at_k", "empty_result_share"],
+                    markers=True,
+                    title="Качество и пустые результаты по threshold",
+                ),
+                width="stretch",
+            )
     except Exception as exc:
         logger.exception("Ошибка загрузки контрольных вопросов")
         st.error(f"Контрольные вопросы недоступны: {exc}")
@@ -829,11 +1380,12 @@ with tab_rag_evaluation:
 with tab_settings:
     st.subheader("Управление сохранёнными данными")
     counts = result_storage.counts()
-    count_a, count_b, count_c, count_d = st.columns(4)
+    count_a, count_b, count_c, count_d, count_e = st.columns(5)
     count_a.metric("Сравнения", counts["comparisons"])
     count_b.metric("Ответы", counts["answers"])
-    count_c.metric("Ручные оценки", counts["manual_evaluations"])
-    count_d.metric("Контрольные результаты", counts["benchmark_results"])
+    count_c.metric("Retrieval-кандидаты", result_storage.retrieval_candidate_count())
+    count_d.metric("Ручные оценки", counts["manual_evaluations"])
+    count_e.metric("Контрольные результаты", counts["benchmark_results"])
 
     if st.button("Экспортировать результаты в JSON", key="export-rag-results"):
         try:
@@ -867,7 +1419,7 @@ with tab_settings:
     ):
         try:
             deleted = clear_sqlite_results(RESULTS_DATABASE, "history")
-            st.session_state.pop("rag-pair", None)
+            st.session_state.pop("rag-results", None)
             st.session_state.pop("rag-run-id", None)
             st.success(f"Удалено записей: {deleted}")
             st.rerun()
@@ -886,7 +1438,8 @@ with tab_settings:
     ):
         try:
             deleted = clear_sqlite_results(RESULTS_DATABASE, "benchmark")
-            st.session_state.pop("rag-benchmark-results", None)
+            st.session_state.pop("reranking-benchmark-results", None)
+            st.session_state.pop("threshold-results", None)
             st.session_state.pop("rag-benchmark-batch", None)
             st.success(f"Удалено записей: {deleted}")
             st.rerun()
@@ -907,9 +1460,11 @@ with tab_settings:
             deleted = clear_sqlite_results(RESULTS_DATABASE, "all_results")
             clear_json_results(RAG_RESULTS_PATH)
             for key in (
-                "rag-pair",
+                "rag-results",
                 "rag-run-id",
-                "rag-benchmark-results",
+                "reranking-benchmark-results",
+                "reranking-benchmark-config",
+                "threshold-results",
                 "rag-benchmark-batch",
             ):
                 st.session_state.pop(key, None)
