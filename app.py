@@ -13,6 +13,7 @@ import plotly.express as px
 import streamlit as st
 
 from src.config import (
+    CHAT_DATABASE,
     DOCUMENTS_DIR,
     INDEX_ROOT,
     MODEL_NAME,
@@ -30,6 +31,8 @@ from src.config import (
     configure_logging,
     ensure_directories,
 )
+from src.chat_storage import ChatStorage
+from src.chat_ui import render_rag_chat
 from src.embeddings import EmbeddingService
 from src.data_management import delete_indexes
 from src.evaluation import (
@@ -68,6 +71,7 @@ configure_logging()
 ensure_directories()
 logger = logging.getLogger(__name__)
 result_storage = ResultStorage(RESULTS_DATABASE)
+chat_storage = ChatStorage(CHAT_DATABASE)
 
 st.set_page_config(page_title="Локальный индексатор документов", layout="wide")
 st.title("Локальный индексатор документов")
@@ -318,7 +322,7 @@ with st.sidebar:
     st.info("Документы и запросы не отправляются во внешние сервисы.")
 
 (tab_documents, tab_indexing, tab_chunks, tab_search, tab_compare, tab_analytics,
- tab_rag, tab_rag_evaluation, tab_settings) = st.tabs(
+ tab_rag, tab_chat, tab_rag_evaluation, tab_settings) = st.tabs(
     [
         "Документы",
         "Индексация",
@@ -327,6 +331,7 @@ with st.sidebar:
         "Сравнение",
         "Аналитика",
         "Сравнение RAG",
+        "RAG-чат",
         "Оценка RAG",
         "Настройки",
     ]
@@ -993,6 +998,10 @@ with tab_rag:
     except Exception as exc:
         logger.exception("Ошибка чтения истории RAG")
         st.error(f"История недоступна: {exc}")
+
+
+with tab_chat:
+    render_rag_chat(chat_storage, get_embedding_service)
 
 
 with tab_rag_evaluation:

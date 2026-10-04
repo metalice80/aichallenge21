@@ -1,0 +1,265 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "id": "scenario_01",
+      "title": "Настройка локального RAG для русскоязычных PDF",
+      "initial_expectation": {
+        "goal": "настроить локальный RAG для русскоязычных PDF",
+        "constraints": [
+          "только CPU",
+          "без внешних API",
+          "использовать structural index",
+          "Final Top-K не больше 3"
+        ],
+        "terms": {}
+      },
+      "turns": [
+        {
+          "user_message": "Моя цель — настроить локальный RAG для русскоязычных PDF. Работаем только на CPU, без внешних API, используем structural index, а Final Top-K должен быть не больше 3.",
+          "expected_state": {
+            "goal_contains": ["локальный RAG", "русскоязычных PDF"],
+            "constraints_contain": ["CPU", "внешних API", "structural", "Top-K"]
+          },
+          "expected_sources": ["README.md"],
+          "expected_answer_elements": ["PDF"]
+        },
+        {
+          "user_message": "Под термином «основной индекс» дальше понимай structural index.",
+          "expected_state": {
+            "goal_contains": ["локальный RAG"],
+            "constraints_contain": ["CPU", "внешних API"],
+            "terms": {"основной индекс": "structural index"}
+          },
+          "expected_sources": ["README.md"],
+          "expected_answer_elements": ["structural"]
+        },
+        {
+          "user_message": "Как его построить для загруженных PDF?",
+          "expected_state": {
+            "goal_contains": ["локальный RAG"],
+            "constraints_contain": ["CPU", "structural"]
+          },
+          "expected_standalone_contains": ["structural", "PDF"],
+          "expected_sources": ["README.md", "guide.md"],
+          "expected_answer_elements": ["индекс"]
+        },
+        {
+          "user_message": "Измени ограничение Final Top-K: теперь допускается не больше 4 вместо 3.",
+          "expected_state": {
+            "goal_contains": ["локальный RAG"],
+            "constraints_contain": ["Top-K", "4"],
+            "constraints_absent": ["Top-K не больше 3"]
+          },
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["4"]
+        },
+        {
+          "user_message": "Ограничение «без внешних API» явно отменяю, но CPU оставляем.",
+          "expected_state": {
+            "goal_contains": ["локальный RAG"],
+            "constraints_contain": ["CPU"],
+            "constraints_absent": ["без внешних API"]
+          },
+          "expected_sources": ["README.md"],
+          "expected_answer_elements": ["CPU"]
+        },
+        {
+          "user_message": "Побочный вопрос: требуется ли OCR для сканированных PDF?",
+          "expected_state": {
+            "goal_contains": ["локальный RAG"],
+            "constraints_contain": ["CPU"]
+          },
+          "expected_sources": ["README.md"],
+          "expected_answer_elements": ["OCR"]
+        },
+        {
+          "user_message": "Вернёмся к основной цели: какие этапы проходят русскоязычные PDF до поиска?",
+          "expected_state": {
+            "goal_contains": ["локальный RAG"],
+            "constraints_contain": ["CPU", "structural"]
+          },
+          "expected_sources": ["document_indexer_omp.md"],
+          "expected_answer_elements": ["chunk"]
+        },
+        {
+          "user_message": "Подтверждённый факт: все мои PDF содержат текстовый слой.",
+          "expected_state": {
+            "goal_contains": ["локальный RAG"],
+            "constraints_contain": ["CPU"]
+          },
+          "expected_sources": [],
+          "expected_answer_elements": []
+        },
+        {
+          "user_message": "Предпочитаю краткие ответы со списком команд.",
+          "expected_state": {
+            "goal_contains": ["локальный RAG"],
+            "constraints_contain": ["CPU"]
+          },
+          "expected_sources": ["README.md"],
+          "expected_answer_elements": ["команд"]
+        },
+        {
+          "user_message": "Какая версия Kubernetes обязательна для этого индексатора?",
+          "expected_state": {
+            "goal_contains": ["локальный RAG"],
+            "constraints_contain": ["CPU"]
+          },
+          "expected_sources": [],
+          "expected_answer_elements": ["не найд"]
+        },
+        {
+          "user_message": "Проверь, что отменённое ограничение про внешние API не вернулось, а лимит Top-K равен 4.",
+          "expected_state": {
+            "goal_contains": ["локальный RAG"],
+            "constraints_contain": ["Top-K", "4"],
+            "constraints_absent": ["без внешних API"]
+          },
+          "expected_sources": [],
+          "expected_answer_elements": ["4"]
+        },
+        {
+          "user_message": "Суммируй итоговый план настройки локального RAG для PDF с учётом цели и активных ограничений.",
+          "expected_state": {
+            "goal_contains": ["локальный RAG", "PDF"],
+            "constraints_contain": ["CPU", "structural", "4"],
+            "constraints_absent": ["без внешних API"]
+          },
+          "expected_sources": ["README.md", "document_indexer_omp.md"],
+          "expected_answer_elements": ["CPU", "structural", "4"]
+        }
+      ]
+    },
+    {
+      "id": "scenario_02",
+      "title": "Повышение качества retrieval и Source Hit@3",
+      "initial_expectation": {
+        "goal": "повысить Source Hit@3",
+        "constraints": [
+          "не менять embedding-модель",
+          "использовать heuristic reranker",
+          "сохранить разумное время ответа",
+          "сравнивать Baseline и Enhanced RAG"
+        ],
+        "terms": {}
+      },
+      "turns": [
+        {
+          "user_message": "Цель — повысить Source Hit@3. Нельзя менять embedding-модель, используем heuristic reranker, сохраняем разумное время ответа и сравниваем Baseline с Enhanced RAG.",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["embedding", "heuristic", "время", "Baseline"]
+          },
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["Source Hit@3"]
+        },
+        {
+          "user_message": "Термин «качество» в этом диалоге означает Source Hit@3, а не качество генерации.",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["embedding", "heuristic"],
+            "terms": {"качество": "Source Hit@3 retrieval"}
+          },
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["Hit@3"]
+        },
+        {
+          "user_message": "С каких значений similarity threshold начать эксперимент?",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["embedding", "heuristic"]
+          },
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["0.35"]
+        },
+        {
+          "user_message": "А как он влияет на пустые результаты?",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["embedding", "heuristic"]
+          },
+          "expected_standalone_contains": ["similarity threshold", "пустые результаты"],
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["порог"]
+        },
+        {
+          "user_message": "Решение: начнём с threshold 0.35 и сравним с 0.30 и 0.40.",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["embedding", "heuristic"]
+          },
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["0.35"]
+        },
+        {
+          "user_message": "Уменьши Final Top-K с 5 до 3 и считай 3 новым активным значением.",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["Final Top-K", "3"],
+            "constraints_absent": ["Final Top-K 5"]
+          },
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["3"]
+        },
+        {
+          "user_message": "Нужен ли Query Rewrite для неоднозначных вопросов?",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["heuristic", "3"]
+          },
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["Query Rewrite"]
+        },
+        {
+          "user_message": "Используй его для следующего запроса: где он сохраняет диагностику?",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["heuristic", "3"]
+          },
+          "expected_standalone_contains": ["Query Rewrite", "диагностику"],
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["SQLite"]
+        },
+        {
+          "user_message": "Побочный вопрос: CrossEncoder обязателен?",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["heuristic", "embedding"]
+          },
+          "expected_sources": ["README.md"],
+          "expected_answer_elements": ["не"]
+        },
+        {
+          "user_message": "Исправление: разумное время ответа означает не более 5 секунд на retrieval, а не на всю генерацию.",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["5 секунд", "retrieval"],
+            "constraints_absent": ["время ответа"]
+          },
+          "expected_sources": [],
+          "expected_answer_elements": ["5"]
+        },
+        {
+          "user_message": "Вернёмся к основной метрике: как сравнить Source Hit@3 до и после reranking?",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["heuristic", "3", "5 секунд"]
+          },
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["Baseline", "Enhanced"]
+        },
+        {
+          "user_message": "Дай итоговый план эксперимента с источниками и проверь, что Final Top-K 5 больше не считается активным.",
+          "expected_state": {
+            "goal_contains": ["Source Hit@3"],
+            "constraints_contain": ["heuristic", "Final Top-K", "3", "5 секунд"],
+            "constraints_absent": ["Final Top-K 5"]
+          },
+          "expected_sources": ["day23_reranking_filtering_omp.md"],
+          "expected_answer_elements": ["0.35", "Hit@3", "3"]
+        }
+      ]
+    }
+  ]
+}

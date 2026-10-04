@@ -14,6 +14,9 @@ data/uploads/*
 !data/uploads/.gitkeep
 data/*.log
 data/results.sqlite
+data/chat.sqlite
+data/chat.sqlite-*
+data/chat_exports/
 evaluation/results.json
 evaluation/.*.tmp
 indexes/fixed/*

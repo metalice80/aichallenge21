@@ -162,6 +162,18 @@ class IndexStorage:
             ).fetchall()
         return {int(row["vector_id"]): dict(row) for row in rows}
 
+    def fetch_by_chunk_id(self, chunk_id: str) -> dict[str, Any] | None:
+        """Получить актуальный текст и метаданные чанка по стабильному ID."""
+        if not self.database_path.is_file():
+            return None
+        with sqlite3.connect(self.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM chunks WHERE chunk_id = ?",
+                (chunk_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def list_chunks(
         self,
         *,
