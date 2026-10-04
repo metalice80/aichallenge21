@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime data
+data/uploads/*
+!data/uploads/.gitkeep
+data/*.log
+indexes/fixed/*
+!indexes/fixed/.gitkeep
+indexes/structural/*
+!indexes/structural/.gitkeep
+!reports/.gitkeep
+
+# Models and caches
+.cache/
+*.bin
+*.safetensors
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/

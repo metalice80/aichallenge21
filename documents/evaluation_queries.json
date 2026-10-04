@@ -1,0 +1,12 @@
+[
+  {"query": "Как установить зависимости и запустить приложение?", "expected_source": "guide.md", "expected_section": "Установка"},
+  {"query": "Какие форматы документов поддерживаются?", "expected_source": "guide.md", "expected_section": "Форматы"},
+  {"query": "Как устроено фиксированное разбиение с перекрытием?", "expected_source": "guide.md", "expected_section": "Фиксированная стратегия"},
+  {"query": "Как структурная стратегия обрабатывает заголовки?", "expected_source": "guide.md", "expected_section": "Структурная стратегия"},
+  {"query": "Почему FAISS использует внутреннее произведение?", "expected_source": "knowledge_base.txt", "expected_section": "ВЕКТОРНЫЙ ПОИСК"},
+  {"query": "Как связаны vector_id в FAISS и SQLite?", "expected_source": "knowledge_base.txt", "expected_section": "ЦЕЛОСТНОСТЬ ДАННЫХ"},
+  {"query": "Как обрабатываются повреждённые документы?", "expected_source": "knowledge_base.txt", "expected_section": "ОБРАБОТКА ОШИБОК"},
+  {"query": "Где вычисляется косинусная близость?", "expected_source": "sample_module.py", "expected_section": "VectorCatalog.search"},
+  {"query": "Как нормализовать вектор?", "expected_source": "sample_module.py", "expected_section": "normalize_vector"},
+  {"query": "Как пакетно добавить записи в каталог?", "expected_source": "sample_module.py", "expected_section": "VectorCatalog.add_many"}
+]
