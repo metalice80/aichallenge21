@@ -1,5 +1,5 @@
 """Локальный индексатор документов."""
 
-from .models import Chunk, Document, IndexingResult
+from .models import AnswerResult, Chunk, Document, IndexingResult, RetrievedChunk
 
-__all__ = ["Chunk", "Document", "IndexingResult"]
+__all__ = ["AnswerResult", "Chunk", "Document", "IndexingResult", "RetrievedChunk"]

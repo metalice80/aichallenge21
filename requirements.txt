@@ -6,3 +6,4 @@ pandas>=2.2,<4
 plotly>=5.24,<7
 numpy>=1.26,<3
 pytest>=8,<10
+# Ollama используется через локальный HTTP API стандартной библиотеки Python.

@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "questions": [
+    {
+      "id": "q01",
+      "question": "Какие команды нужны для установки зависимостей и запуска приложения?",
+      "expectation": "Ответ должен упомянуть виртуальное окружение, установку requirements.txt и запуск Streamlit.",
+      "expected_keywords": ["venv", "pip install", "streamlit run"],
+      "expected_sources": ["guide.md"]
+    },
+    {
+      "id": "q02",
+      "question": "Какие четыре основных формата документов поддерживает индексатор?",
+      "expectation": "Ответ должен перечислить PDF, Markdown, TXT и Python.",
+      "expected_keywords": ["PDF", "Markdown", "TXT", "Python"],
+      "expected_sources": ["guide.md"]
+    },
+    {
+      "id": "q03",
+      "question": "Как работает фиксированное разбиение и зачем нужен overlap?",
+      "expectation": "Ответ должен описать окна по 500 токенов, перекрытие 80 токенов и сохранение контекста на границах.",
+      "expected_keywords": ["500", "80", "перекрыт"],
+      "expected_sources": ["guide.md"]
+    },
+    {
+      "id": "q04",
+      "question": "Как структурная стратегия обрабатывает заголовки Markdown и длинные секции?",
+      "expectation": "Ответ должен упомянуть иерархию заголовков, поле section и дополнительное деление длинной секции.",
+      "expected_keywords": ["заголов", "section", "дел"],
+      "expected_sources": ["guide.md"]
+    },
+    {
+      "id": "q05",
+      "question": "Как обеспечивается соответствие vector_id между FAISS и SQLite?",
+      "expectation": "Ответ должен описать первичный ключ SQLite, позицию в FAISS и непрерывный диапазон идентификаторов.",
+      "expected_keywords": ["vector_id", "FAISS", "SQLite", "непрерыв"],
+      "expected_sources": ["knowledge_base.txt"]
+    },
+    {
+      "id": "q06",
+      "question": "Как приложение обрабатывает повреждённый PDF и неверную кодировку?",
+      "expectation": "Ответ должен указать на понятные пользовательские ошибки и запись технических подробностей в журнал.",
+      "expected_keywords": ["ошиб", "журнал", "кодиров"],
+      "expected_sources": ["knowledge_base.txt", "guide.md"]
+    },
+    {
+      "id": "q07",
+      "question": "Почему индекс записывается через временные файлы и атомарную замену?",
+      "expectation": "Ответ должен объяснить защиту рабочей версии от частично записанных или повреждённых файлов.",
+      "expected_keywords": ["временн", "атомар", "поврежд"],
+      "expected_sources": ["knowledge_base.txt"]
+    },
+    {
+      "id": "q08",
+      "question": "Как функция normalize_vector обрабатывает нулевой и ненулевой вектор?",
+      "expectation": "Ответ по исходному коду должен указать, что нулевой вектор возвращается без изменения, а ненулевой делится на евклидову норму.",
+      "expected_keywords": ["нулев", "норм", "дел"],
+      "expected_sources": ["sample_module.py"]
+    },
+    {
+      "id": "q09",
+      "question": "Как метод VectorCatalog.add_many добавляет пакет записей?",
+      "expectation": "Ответ по исходному коду должен сообщить, что метод последовательно вызывает add и возвращает количество записей.",
+      "expected_keywords": ["add", "последовательно", "количеств"],
+      "expected_sources": ["sample_module.py"]
+    },
+    {
+      "id": "q10",
+      "question": "Какой пароль администратора установлен в приложении?",
+      "expectation": "В документах нет пароля администратора; ответ должен прямо признать недостаток информации и не придумывать источник.",
+      "expected_keywords": ["нет информации"],
+      "expected_sources": []
+    }
+  ]
+}

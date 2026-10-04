@@ -13,6 +13,9 @@ venv/
 data/uploads/*
 !data/uploads/.gitkeep
 data/*.log
+data/results.sqlite
+evaluation/results.json
+evaluation/.*.tmp
 indexes/fixed/*
 !indexes/fixed/.gitkeep
 indexes/structural/*
